@@ -7,11 +7,13 @@ from io import BytesIO
 import zipfile
 from threading import Thread
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 # ================== Cấu hình ==================
 API_KEY_REMOVE_BG = "8jhDKvHsX4JriY9B9dvvJQTb"
 TEMP_IMAGE_LIFETIME = 5 * 60  # 5 phút
-temp_images = {}
+temp_images = {}  # Lưu (bytes, timestamp, is_video)
+temp_videos = {}  # Tách riêng cho video để dễ quản lý
 
 app = Flask(__name__)
 app.secret_key = 'super_secret_key_for_session'  # Cần cho session
@@ -38,36 +40,54 @@ def remove_bg(image_url, retries=3):
         time.sleep(1)
     raise Exception("Failed to remove background after retries.")
 
-def download_pinterest_img(url, csrf):
+def download_pinterest_media(url, csrf):
     r = requests.post("https://klickpin.com/download", data={"url": url, "csrf_token": csrf})
     html = r.text
 
     match = re.search(r"downloadFile\('([^']+)'", html)
     if not match:
-        raise Exception("Không tìm thấy link ảnh/video.")
-    img_url = match.group(1)
-    if not img_url.startswith("http"):
-        raise Exception("Link ảnh không hợp lệ.")
-    if not img_url.endswith((".jpg", ".png")):
-        raise Exception("Không phải ảnh, không thể xóa nền.")
-    return img_url
+        raise Exception("Không tìm thấy link media.")
+    media_url = match.group(1)
+    if not media_url.startswith("http"):
+        raise Exception("Link media không hợp lệ.")
+    
+    # Kiểm tra loại file
+    parsed = urlparse(media_url)
+    ext = parsed.path.split('.')[-1].lower() if '.' in parsed.path else ''
+    is_video = ext in ['mp4', 'webm', 'mov', 'avi', 'mkv']
+    if is_video:
+        return media_url, True
+    elif ext in ['jpg', 'jpeg', 'png', 'gif']:
+        return media_url, False
+    else:
+        raise Exception("Không hỗ trợ loại media này (chỉ ảnh JPG/PNG/GIF và video MP4/WEBM/MOV/AVI/MKV).")
+
+def download_media_bytes(media_url):
+    response = requests.get(media_url, timeout=30)
+    if response.status_code == 200:
+        return response.content
+    raise Exception(f"Lỗi tải media: {response.status_code}")
 
 # ================== Cleanup thread ==================
-def cleanup_temp_images():
+def cleanup_temp_media():
     while True:
         now = time.time()
         keys_to_delete = [k for k, (_, ts) in temp_images.items() if now - ts > TEMP_IMAGE_LIFETIME]
         for k in keys_to_delete:
             print(f"🗑️ Xóa ảnh tạm: {k}")
             del temp_images[k]
+        keys_to_delete_v = [k for k, (_, ts) in temp_videos.items() if now - ts > TEMP_IMAGE_LIFETIME]
+        for k in keys_to_delete_v:
+            print(f"🗑️ Xóa video tạm: {k}")
+            del temp_videos[k]
         time.sleep(30)
 
-Thread(target=cleanup_temp_images, daemon=True).start()
+Thread(target=cleanup_temp_media, daemon=True).start()
 
 # ================== Routes ==================
 @app.route("/", methods=["GET", "POST"])
 def index():
-    result_imgs = []  # list lưu tuples (filename, error_msg)
+    result_media = []  # list lưu tuples (filename, error_msg, is_video)
     error_msg = None
 
     if request.method == "POST":
@@ -91,37 +111,48 @@ def index():
                     pending = []
                     for link in links:
                         try:
-                            img_url = download_pinterest_img(link, csrf)
-                            pending.append((link, img_url))
-                            log(f"📥 Đã lấy link ảnh cho: {link[:50]}...")
+                            media_url, is_video = download_pinterest_media(link, csrf)
+                            pending.append((link, media_url, is_video))
+                            log(f"📥 Đã lấy link {'video' if is_video else 'ảnh'} cho: {link[:50]}...")
                         except Exception as e:
-                            result_imgs.append((None, f"{link}: {str(e)}"))
+                            result_media.append((None, f"{link}: {str(e)}", False))
                     
                     if pending:
-                        # Tự động xóa nền song song cho tất cả pending, số luồng = số link
+                        # Xử lý song song cho tất cả pending, số luồng = số media
                         num_workers = len(pending)
                         result_names = []
                         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                            future_to_plink = {executor.submit(remove_bg, imgurl): plink for plink, imgurl in pending}
-                            for future in as_completed(future_to_plink):
-                                plink = future_to_plink[future]
+                            futures = []
+                            for plink, mediaurl, is_vid in pending:
+                                if is_vid:
+                                    # Với video: chỉ tải bytes gốc
+                                    future = executor.submit(download_media_bytes, mediaurl)
+                                else:
+                                    # Với ảnh: xóa nền rồi tải bytes
+                                    future = executor.submit(remove_bg, mediaurl)
+                                futures.append((future, plink, is_vid, mediaurl))
+                            
+                            for future, plink, is_vid, mediaurl in futures:
                                 try:
-                                    img_bytes = future.result()
-                                    # Tìm index dựa trên plink (giả sử plink unique)
-                                    i = next(idx for idx, (p, _) in enumerate(pending) if p == plink)
-                                    result_img_name = f"removed_bg_{i}_{random.randint(1000,9999)}.png"
-                                    temp_images[result_img_name] = (img_bytes, time.time())
-                                    result_imgs.append((result_img_name, None))
-                                    result_names.append(result_img_name)
-                                    log(f"✅ Hoàn thành xóa nền cho {plink[:50]}...")
+                                    media_bytes = future.result()
+                                    i = len(result_names)  # Index theo thứ tự hoàn thành
+                                    if is_vid:
+                                        result_filename = f"video_{i}_{random.randint(1000,9999)}.mp4"
+                                        temp_videos[result_filename] = (media_bytes, time.time())
+                                    else:
+                                        result_filename = f"removed_bg_{i}_{random.randint(1000,9999)}.png"
+                                        temp_images[result_filename] = (media_bytes, time.time())
+                                    result_media.append((result_filename, None, is_vid))
+                                    result_names.append(result_filename)
+                                    log(f"✅ Hoàn thành xử lý {'xóa nền' if not is_vid else 'tải'} cho {plink[:50]}...")
                                 except Exception as e:
-                                    result_imgs.append((None, f"{plink}: {str(e)}"))
-                                    log(f"❌ Lỗi xóa nền cho {plink}: {e}")
+                                    result_media.append((None, f"{plink}: {str(e)}", is_vid))
+                                    log(f"❌ Lỗi xử lý cho {plink}: {e}")
                         session['result_names'] = result_names
                     else:
-                        error_msg = "Không thể lấy link ảnh từ bất kỳ Pinterest nào!"
+                        error_msg = "Không thể lấy media từ bất kỳ Pinterest nào!"
 
-    # Lấy result_names từ session nếu có (nhưng thường thì không cần vì xử lý ngay)
+    # Lấy result_names từ session nếu có
     result_names = session.get('result_names', [])
 
     html = """
@@ -129,7 +160,7 @@ def index():
     <html lang="vi">
     <head>
         <meta charset="UTF-8">
-        <title>✨ Xóa nền Pinterest</title>
+        <title>✨ Pinterest</title>
         <style>
             * { box-sizing: border-box; margin:0; padding:0; }
             body { 
@@ -229,6 +260,19 @@ def index():
                 background:linear-gradient(90deg, #00b894, #00cec9); 
                 opacity:0.8; 
             }
+            .video-preview { 
+                width:100%; 
+                height:280px; 
+                object-fit:cover; 
+                border-radius:16px; 
+                border:3px solid #333; 
+                box-shadow:0 6px 20px rgba(0,0,0,0.3); 
+                margin-bottom:18px; 
+                transition: all 0.3s; 
+            }
+            .video-preview:hover { 
+                box-shadow:0 10px 30px rgba(0,0,0,0.4); 
+            }
             img { 
                 width:100%; 
                 height:280px; 
@@ -319,6 +363,12 @@ def index():
                 cursor: zoom-out;
                 transform: scale(2);
             }
+            .video-modal {
+                width: 80%;
+                max-width: 1200px;
+                max-height: 90%;
+                margin: auto;
+            }
             .close {
                 position: absolute;
                 top: 15px;
@@ -336,10 +386,10 @@ def index():
                 .container { padding:25px; }
                 h1 { font-size:2em; }
                 h2 { font-size:1.5em; }
-                .modal-content { width: 95%; }
+                .modal-content, .video-modal { width: 95%; }
             }
             @media(max-width:480px){
-                img { height:220px; }
+                .video-preview, img { height:220px; }
                 button { padding:15px 25px; font-size:16px; }
                 a.download-all-btn { padding:15px 30px; font-size:18px; }
             }
@@ -347,31 +397,38 @@ def index():
     </head>
     <body>
         <div class="container">
-            <h1>🖼️ Xóa nền Pinterest</h1>
+            <h1>🖼️ Pinterest (Ảnh/Video)</h1>
             <form method="post">
-                <textarea name="urls" placeholder="Nhập 1 hoặc nhiều link Pinterest (hỗ trợ dán liên tiếp, tự động tách! Mỗi link 1 dòng hoặc dán sát nhau)..." required>{{ request.form.get('urls','') if request.method == 'POST' else '' }}</textarea>
+                <textarea name="urls" placeholder="Nhập 1 hoặc nhiều link Pinterest (hỗ trợ ảnh/video, dán liên tiếp tự tách)..." required>{{ request.form.get('urls','') if request.method == 'POST' else '' }}</textarea>
                 <br>
-                <button type="submit">🚀 Xóa nền</button>
+                <button type="submit">🚀 Xử lý</button>
             </form>
 
             {% if error_msg %}
                 <div class="error">{{ error_msg }}</div>
             {% endif %}
 
-            {% if result_imgs %}
-                <h2>✅ Đã xóa nền {{ result_imgs|length }} ảnh!</h2>
-                <a href="/download_all" class="download-all-btn">📦 Tải tất cả ảnh (ZIP)</a>
+            {% if result_media %}
+                <h2>✅ Đã xử lý {{ result_media|length }}!</h2>
+                <a href="/download_all" class="download-all-btn">📦 Tải tất cả (ZIP)</a>
                 <div class="gallery">
-                    {% for filename, err in result_imgs %}
+                    {% for filename, err, is_video in result_media %}
                         {% if err %}
                             <div class="card">
                                 <div class="error" style="margin:0;">{{ err }}</div>
                             </div>
                         {% else %}
                             <div class="card">
-                                <img src="/image/{{ filename }}" alt="Preview ảnh xóa nền" onclick="openModal('/image/{{ filename }}')">
+                                {% if is_video %}
+                                    <video class="video-preview" controls onclick="openVideoModal('/video/{{ filename }}')">
+                                        <source src="/video/{{ filename }}" type="video/mp4">
+                                        Trình duyệt không hỗ trợ video.
+                                    </video>
+                                {% else %}
+                                    <img src="/image/{{ filename }}" alt="Preview" onclick="openModal('/image/{{ filename }}')">
+                                {% endif %}
                                 <br>
-                                <a class="download-btn" href="/image/{{ filename }}" download="{{ filename }}">⬇️ Tải ảnh PNG</a>
+                                <a class="download-btn" href="{% if is_video %}/video/{% else %}/image/{% endif %}{{ filename }}" download="{{ filename }}">⬇️ Tải {{ 'Video' if is_video else 'Ảnh PNG' }}</a>
                             </div>
                         {% endif %}
                     {% endfor %}
@@ -381,10 +438,18 @@ def index():
             {% endif %}
         </div>
 
-        <!-- Modal -->
+        <!-- Modal cho ảnh -->
         <div id="imageModal" class="modal">
             <span class="close" onclick="closeModal()">&times;</span>
             <img class="modal-content" id="modalImg" onclick="toggleZoom()">
+        </div>
+
+        <!-- Modal cho video -->
+        <div id="videoModal" class="modal">
+            <span class="close" onclick="closeVideoModal()">&times;</span>
+            <video class="video-modal" controls id="modalVideo">
+                <!-- Source sẽ set bằng JS -->
+            </video>
         </div>
 
         <script>
@@ -396,35 +461,46 @@ def index():
                 modalImg.src = src;
                 isZoomed = false;
                 modalImg.classList.remove('zoomed');
-                document.body.style.overflow = 'hidden'; // Ngăn scroll body
+                document.body.style.overflow = 'hidden';
             }
             function closeModal() {
-                const modal = document.getElementById('imageModal');
-                modal.style.display = 'none';
-                document.body.style.overflow = 'auto'; // Cho phép scroll lại
+                document.getElementById('imageModal').style.display = 'none';
+                document.body.style.overflow = 'auto';
             }
             function toggleZoom() {
                 const modalImg = document.getElementById('modalImg');
                 isZoomed = !isZoomed;
                 modalImg.classList.toggle('zoomed');
             }
-            // Đóng modal khi click ngoài ảnh
-            window.onclick = function(event) {
-                const modal = document.getElementById('imageModal');
-                if (event.target == modal) {
-                    closeModal();
-                }
+            function openVideoModal(src) {
+                const modal = document.getElementById('videoModal');
+                const modalVideo = document.getElementById('modalVideo');
+                modalVideo.src = src;
+                modal.style.display = 'block';
+                document.body.style.overflow = 'hidden';
             }
-            // Hỗ trợ zoom bằng wheel (scroll)
+            function closeVideoModal() {
+                document.getElementById('videoModal').style.display = 'none';
+                document.getElementById('modalVideo').pause(); // Dừng video
+                document.body.style.overflow = 'auto';
+            }
+            // Đóng modal khi click ngoài
+            window.onclick = function(event) {
+                const imageModal = document.getElementById('imageModal');
+                const videoModal = document.getElementById('videoModal');
+                if (event.target == imageModal) closeModal();
+                if (event.target == videoModal) closeVideoModal();
+            }
+            // Hỗ trợ zoom ảnh bằng wheel
             document.getElementById('imageModal').addEventListener('wheel', function(e) {
                 e.preventDefault();
-                toggleZoom(); // Toggle zoom khi scroll wheel
+                toggleZoom();
             });
         </script>
     </body>
     </html>
     """
-    return render_template_string(html, result_imgs=result_imgs, error_msg=error_msg)
+    return render_template_string(html, result_media=result_media, error_msg=error_msg)
 
 @app.route("/image/<filename>")
 def serve_image(filename):
@@ -433,11 +509,18 @@ def serve_image(filename):
         return send_file(BytesIO(data), mimetype="image/png", as_attachment=False)
     return "File not found", 404
 
+@app.route("/video/<filename>")
+def serve_video(filename):
+    if filename in temp_videos:
+        data, _ = temp_videos[filename]
+        return send_file(BytesIO(data), mimetype="video/mp4", as_attachment=False)
+    return "File not found", 404
+
 @app.route("/download_all")
 def download_all():
     result_names = session.get('result_names', [])
     if not result_names:
-        return "No images to download", 404
+        return "No media to download", 404
     
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
@@ -445,11 +528,14 @@ def download_all():
             if name in temp_images:
                 data, _ = temp_images[name]
                 zip_file.writestr(name, data)
+            elif name in temp_videos:
+                data, _ = temp_videos[name]
+                zip_file.writestr(name, data)
     
     zip_buffer.seek(0)
     return send_file(
         zip_buffer,
         mimetype="application/zip",
         as_attachment=True,
-        download_name="removed_backgrounds_all.zip"
+        download_name="File.zip"
     )
