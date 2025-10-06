@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 # ================== Cấu hình ==================
 TEMP_IMAGE_LIFETIME = 5 * 60   # 5 phút
-THRESHOLD_CREATE_NEW_ACCOUNT = 40
+THRESHOLD_CREATE_NEW_ACCOUNT = 50
 API_KEY_FIREBASE = "AIzaSyDFZKo486yrXEXkjjJ5gwpozE7G9UkbNgU"
 REMBG_API_URL = "https://www.rembg.com/api/api-keys"
 
@@ -553,11 +553,17 @@ def serve_video(filename):
 @app.route("/download_all")
 def download_all():
     result_names = session.get('result_names', [])
-    if not result_names: return "No media", 404
+    if not result_names:
+        return "No media", 404
     zip_buf = BytesIO()
+    file_count = 0
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
         for name in result_names:
-            data = temp_images.get(name, [None])[0] or temp_videos.get(name, [None])[0]
-            if data: z.writestr(name, data)
+            data_tuple = temp_images.get(name) or temp_videos.get(name)
+            if data_tuple:
+                z.writestr(name, data_tuple[0])
+                file_count += 1
+    if file_count == 0:
+        return "No files available", 404
     zip_buf.seek(0)
     return send_file(zip_buf, mimetype="application/zip", as_attachment=True, download_name="pinterest_media.zip")
