@@ -1,161 +1,197 @@
-import time
-import random
-import re
-import requests
+import time, random, re, string, requests, json, zipfile
 from flask import Flask, request, render_template_string, send_file, session
 from io import BytesIO
-import zipfile
-from threading import Thread
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
+from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
 
 # ================== Cấu hình ==================
-API_KEY_REMOVE_BG = "8jhDKvHsX4JriY9B9dvvJQTb"
-TEMP_IMAGE_LIFETIME = 5 * 60  # 5 phút
-temp_images = {}  # Lưu (bytes, timestamp, is_video)
-temp_videos = {}  # Tách riêng cho video để dễ quản lý
+TEMP_IMAGE_LIFETIME = 5 * 60   # 5 phút
+THRESHOLD_CREATE_NEW_ACCOUNT = 40
+API_KEY_FIREBASE = "AIzaSyDFZKo486yrXEXkjjJ5gwpozE7G9UkbNgU"
+REMBG_API_URL = "https://www.rembg.com/api/api-keys"
+
+temp_images = {}   # filename -> (bytes, timestamp)
+temp_videos = {}
+accounts = []      # {"email":..., "password":..., "rembg_key":..., "used":int}
 
 app = Flask(__name__)
-app.secret_key = 'super_secret_key_for_session'  # Cần cho session
+app.secret_key = 'super_secret_key_for_session'
 
 # ================== Hỗ trợ ==================
-def log(msg):
-    print(f"🌀 {msg}")
+def log(msg): print(f"🌀 {msg}")
 
-def remove_bg(image_url, retries=3):
-    for i in range(retries):
+def rand_email():
+    dom = random.choice(requests.get("https://api.mail.tm/domains").json()["hydra:member"])["domain"]
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=10)) + "@" + dom
+
+def rand_pass(): return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+def rand_name(): return ''.join(random.choices(string.ascii_lowercase + string.digits, k=8)) + str(random.randint(0,999))
+
+def safe_post(url, **kwargs):
+    for _ in range(3):
         try:
-            response = requests.post(
-                'https://api.remove.bg/v1.0/removebg',
-                data={'image_url': image_url, 'size': 'auto'},
-                headers={'X-Api-Key': API_KEY_REMOVE_BG},
-                timeout=15
-            )
-            if response.status_code == 200:
-                return response.content
-            else:
-                log(f"Lỗi Remove.bg ({response.status_code}): {response.text}")
-        except requests.exceptions.RequestException as e:
-            log(f"Lỗi request Remove.bg: {e}")
-        time.sleep(1)
-    raise Exception("Failed to remove background after retries.")
+            r = requests.post(url, timeout=20, **kwargs)
+            if 200 <= r.status_code < 300 or r.status_code in [400]:
+                return r
+        except Exception as e:
+            print("⚠️ Retry:", e)
+        time.sleep(2)
+    raise Exception(f"❌ Request thất bại: {url}")
 
+# ================== Tạo & xác thực tài khoản rembg ==================
+def create_new_account():
+    email, password, name = rand_email(), rand_pass(), rand_name()
+    log(f"📧 Tạo mail: {email}")
+    safe_post("https://api.mail.tm/accounts", json={"address": email, "password": password})
+    token = safe_post("https://api.mail.tm/token", json={"address": email, "password": password}).json().get("token")
+    h_mail = {"Authorization": f"Bearer {token}"}
+
+    # --- Signup Firebase ---
+    signup = safe_post(
+        f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={API_KEY_FIREBASE}",
+        json={"returnSecureToken": True, "email": email, "password": password, "clientType":"CLIENT_TYPE_WEB"}
+    ).json()
+    id_token = signup.get("idToken")
+
+    # --- Gửi mail xác minh ---
+    safe_post(
+        f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={API_KEY_FIREBASE}",
+        json={"requestType":"VERIFY_EMAIL","idToken":id_token}
+    )
+
+    # --- Xác thực mail ---
+    log(f"📬 Đang chờ xác thực email: {email}")
+    verified = False
+    checked_ids = set()
+    for _ in range(60):
+        msgs = requests.get("https://api.mail.tm/messages", headers=h_mail).json().get("hydra:member", [])
+        for m in msgs:
+            if m['id'] in checked_ids: continue
+            checked_ids.add(m['id'])
+            msg = requests.get(f"https://api.mail.tm/messages/{m['id']}", headers=h_mail).json()
+            text = msg.get("text", "")
+            m_obj = re.search(r'oobCode=([^&]+)', text)
+            if m_obj:
+                oobCode = m_obj.group(1)
+                resp = safe_post(
+                    f"https://www.googleapis.com/identitytoolkit/v3/relyingparty/setAccountInfo?key={API_KEY_FIREBASE}",
+                    json={"oobCode": oobCode}
+                ).json()
+                log("✅ Đã xác thực email!")
+                verified = True
+                break
+        if verified: break
+        time.sleep(5)
+
+    if not verified:
+        raise Exception("❌ Hết thời gian xác thực mail!")
+
+    # --- Lấy API key ---
+    r3 = safe_post(
+        REMBG_API_URL,
+        headers={"Authorization": f"Bearer {id_token}", "Content-Type":"application/json"},
+        json={}
+    ).json()
+    rembg_key = r3.get("newApiKey") or (r3.get("newApiKeys") and r3["newApiKeys"][0])
+    acc = {"email": email, "password": password, "rembg_key": rembg_key, "used": 0}
+    accounts.append(acc)
+    log(f"✅ Đã tạo tài khoản rembg: {email}")
+    return acc
+
+# ================== Pinterest Downloader ==================
 def download_pinterest_media(url, csrf):
     r = requests.post("https://klickpin.com/download", data={"url": url, "csrf_token": csrf})
     html = r.text
-
     match = re.search(r"downloadFile\('([^']+)'", html)
-    if not match:
-        raise Exception("Không tìm thấy link media.")
+    if not match: raise Exception("Không tìm thấy link media.")
     media_url = match.group(1)
     if not media_url.startswith("http"):
         raise Exception("Link media không hợp lệ.")
-    
-    # Kiểm tra loại file
-    parsed = urlparse(media_url)
-    ext = parsed.path.split('.')[-1].lower() if '.' in parsed.path else ''
+    ext = urlparse(media_url).path.split('.')[-1].lower()
     is_video = ext in ['mp4', 'webm', 'mov', 'avi', 'mkv']
-    if is_video:
-        return media_url, True
-    elif ext in ['jpg', 'jpeg', 'png', 'gif']:
-        return media_url, False
-    else:
-        raise Exception("Không hỗ trợ loại media này (chỉ ảnh JPG/PNG/GIF và video MP4/WEBM/MOV/AVI/MKV).")
+    return media_url, is_video
 
-def download_media_bytes(media_url):
-    response = requests.get(media_url, timeout=30)
-    if response.status_code == 200:
-        return response.content
-    raise Exception(f"Lỗi tải media: {response.status_code}")
+# ================== Remove background ==================
+def remove_bg_with_key(image_url, rembg_key):
+    r = requests.get(image_url, timeout=20)
+    r.raise_for_status()
+    img_bytes = r.content
+    resp = requests.post(
+        "https://api.rembg.com/rmbg",
+        headers={"x-api-key": rembg_key},
+        files={"image": ("image.png", BytesIO(img_bytes), "image/png")},
+        data={"format":"png"},
+        timeout=60
+    )
+    if resp.status_code != 200:
+        raise Exception(f"Rembg lỗi: {resp.status_code} {resp.text}")
+    return resp.content
 
 # ================== Cleanup thread ==================
 def cleanup_temp_media():
     while True:
         now = time.time()
-        keys_to_delete = [k for k, (_, ts) in temp_images.items() if now - ts > TEMP_IMAGE_LIFETIME]
-        for k in keys_to_delete:
-            print(f"🗑️ Xóa ảnh tạm: {k}")
-            del temp_images[k]
-        keys_to_delete_v = [k for k, (_, ts) in temp_videos.items() if now - ts > TEMP_IMAGE_LIFETIME]
-        for k in keys_to_delete_v:
-            print(f"🗑️ Xóa video tạm: {k}")
-            del temp_videos[k]
+        for k, (_, ts) in list(temp_images.items()):
+            if now - ts > TEMP_IMAGE_LIFETIME:
+                del temp_images[k]; log(f"🗑️ Xóa ảnh {k}")
+        for k, (_, ts) in list(temp_videos.items()):
+            if now - ts > TEMP_IMAGE_LIFETIME:
+                del temp_videos[k]; log(f"🗑️ Xóa video {k}")
         time.sleep(30)
-
 Thread(target=cleanup_temp_media, daemon=True).start()
 
-# ================== Routes ==================
+# ================== Flask Routes ==================
 @app.route("/", methods=["GET", "POST"])
 def index():
-    result_media = []  # list lưu tuples (filename, error_msg, is_video)
-    error_msg = None
-
+    result_media, error_msg = [], None
     if request.method == "POST":
         pinterest_text = request.form.get("urls", "").strip()
-        if not pinterest_text:
-            error_msg = "Vui lòng nhập ít nhất một link Pinterest!"
+        pinterest_pattern = r'https?://(?:www\.)?pinterest\.(?:com|ca|uk|fr|de|jp|au|in)/pin/\d+/?'
+        links = re.findall(pinterest_pattern, pinterest_text)
+        if not links:
+            error_msg = "Không tìm thấy link Pinterest hợp lệ!"
         else:
-            # Tự động tách các link Pinterest từ text input
-            pinterest_pattern = r'https?://(?:www\.)?pinterest\.(?:com|ca|uk|fr|de|jp|au|in)/pin/\d+/?'
-            links = re.findall(pinterest_pattern, pinterest_text)
-            if not links:
-                error_msg = "Không tìm thấy link Pinterest hợp lệ trong input!"
+            t = int(time.time() * 1000)
+            csrf_resp = requests.get(f"https://klickpin.com/get-csrf-token.php?t={t}")
+            csrf = csrf_resp.json().get("csrf_token") if csrf_resp.ok else None
+            if not csrf:
+                error_msg = "Không lấy được CSRF token!"
             else:
-                # Lấy CSRF token chỉ 1 lần cho toàn bộ request
-                t = int(time.time() * 1000)
-                csrf_resp = requests.get(f"https://klickpin.com/get-csrf-token.php?t={t}")
-                csrf = csrf_resp.json().get("csrf_token") if csrf_resp.ok else None
-                if not csrf:
-                    error_msg = "Không lấy được CSRF token từ klickpin!"
-                else:
-                    pending = []
-                    for link in links:
-                        try:
-                            media_url, is_video = download_pinterest_media(link, csrf)
-                            pending.append((link, media_url, is_video))
-                            log(f"📥 Đã lấy link {'video' if is_video else 'ảnh'} cho: {link[:50]}...")
-                        except Exception as e:
-                            result_media.append((None, f"{link}: {str(e)}", False))
-                    
-                    if pending:
-                        # Xử lý song song cho tất cả pending, số luồng = số media
-                        num_workers = len(pending)
-                        result_names = []
-                        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                            futures = []
-                            for plink, mediaurl, is_vid in pending:
+                pending = []
+                for link in links:
+                    try:
+                        media_url, is_video = download_pinterest_media(link, csrf)
+                        pending.append((link, media_url, is_video))
+                    except Exception as e:
+                        result_media.append((None, f"{link}: {str(e)}", False))
+                if pending:
+                    with ThreadPoolExecutor(max_workers=len(pending)) as executor:
+                        futures = []
+                        for plink, mediaurl, is_vid in pending:
+                            if not accounts or accounts[-1]['used'] >= THRESHOLD_CREATE_NEW_ACCOUNT:
+                                create_new_account()
+                            acc = accounts[-1]
+                            if is_vid:
+                                future = executor.submit(lambda u: requests.get(u).content, mediaurl)
+                            else:
+                                future = executor.submit(remove_bg_with_key, mediaurl, acc['rembg_key'])
+                                acc['used'] += 1
+                            futures.append((future, plink, is_vid))
+                        for future, plink, is_vid in futures:
+                            try:
+                                media_bytes = future.result()
+                                name = f"{'video' if is_vid else 'removed_bg'}_{random.randint(1000,9999)}.{ 'mp4' if is_vid else 'png' }"
                                 if is_vid:
-                                    # Với video: chỉ tải bytes gốc
-                                    future = executor.submit(download_media_bytes, mediaurl)
+                                    temp_videos[name] = (media_bytes, time.time())
                                 else:
-                                    # Với ảnh: xóa nền rồi tải bytes
-                                    future = executor.submit(remove_bg, mediaurl)
-                                futures.append((future, plink, is_vid, mediaurl))
-                            
-                            for future, plink, is_vid, mediaurl in futures:
-                                try:
-                                    media_bytes = future.result()
-                                    i = len(result_names)  # Index theo thứ tự hoàn thành
-                                    if is_vid:
-                                        result_filename = f"video_{i}_{random.randint(1000,9999)}.mp4"
-                                        temp_videos[result_filename] = (media_bytes, time.time())
-                                    else:
-                                        result_filename = f"removed_bg_{i}_{random.randint(1000,9999)}.png"
-                                        temp_images[result_filename] = (media_bytes, time.time())
-                                    result_media.append((result_filename, None, is_vid))
-                                    result_names.append(result_filename)
-                                    log(f"✅ Hoàn thành xử lý {'xóa nền' if not is_vid else 'tải'} cho {plink[:50]}...")
-                                except Exception as e:
-                                    result_media.append((None, f"{plink}: {str(e)}", is_vid))
-                                    log(f"❌ Lỗi xử lý cho {plink}: {e}")
-                        session['result_names'] = result_names
-                    else:
-                        error_msg = "Không thể lấy media từ bất kỳ Pinterest nào!"
+                                    temp_images[name] = (media_bytes, time.time())
+                                result_media.append((name, None, is_vid))
+                            except Exception as e:
+                                result_media.append((None, f"{plink}: {str(e)}", is_vid))
+                    session['result_names'] = [x[0] for x in result_media if x[0]]
 
-    # Lấy result_names từ session nếu có
-    result_names = session.get('result_names', [])
-
-    html = """
+    template_html = """
     <!DOCTYPE html>
     <html lang="vi">
     <head>
@@ -500,42 +536,28 @@ def index():
     </body>
     </html>
     """
-    return render_template_string(html, result_media=result_media, error_msg=error_msg)
+    return render_template_string(template_html, result_media=result_media, error_msg=error_msg, request=request)
 
 @app.route("/image/<filename>")
 def serve_image(filename):
     if filename in temp_images:
-        data, _ = temp_images[filename]
-        return send_file(BytesIO(data), mimetype="image/png", as_attachment=False)
+        return send_file(BytesIO(temp_images[filename][0]), mimetype="image/png")
     return "File not found", 404
 
 @app.route("/video/<filename>")
 def serve_video(filename):
     if filename in temp_videos:
-        data, _ = temp_videos[filename]
-        return send_file(BytesIO(data), mimetype="video/mp4", as_attachment=False)
+        return send_file(BytesIO(temp_videos[filename][0]), mimetype="video/mp4")
     return "File not found", 404
 
 @app.route("/download_all")
 def download_all():
     result_names = session.get('result_names', [])
-    if not result_names:
-        return "No media to download", 404
-    
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+    if not result_names: return "No media", 404
+    zip_buf = BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
         for name in result_names:
-            if name in temp_images:
-                data, _ = temp_images[name]
-                zip_file.writestr(name, data)
-            elif name in temp_videos:
-                data, _ = temp_videos[name]
-                zip_file.writestr(name, data)
-    
-    zip_buffer.seek(0)
-    return send_file(
-        zip_buffer,
-        mimetype="application/zip",
-        as_attachment=True,
-        download_name="File.zip"
-    )
+            data = temp_images.get(name, [None])[0] or temp_videos.get(name, [None])[0]
+            if data: z.writestr(name, data)
+    zip_buf.seek(0)
+    return send_file(zip_buf, mimetype="application/zip", as_attachment=True, download_name="pinterest_media.zip")
